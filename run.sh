@@ -3,14 +3,48 @@
 set -euo pipefail
 
 cleanup() {
-    test $? -eq 0 || wg-quick down wg0
-    tail -f /dev/null
+    wg-quick down wg0 || true
 }
 
 trap "cleanup" TERM INT QUIT EXIT
 
+insmod() {
+
+	if lsmod | grep wireguard 2>&1
+	then
+		cat /sys/module/wireguard/version
+		echo "Wireguard module is loaded."
+		return 0
+	fi
+
+	local mod="/usr/src/app/wireguard.ko"
+
+	modinfo "${mod}"
+    echo "Loading wireguard module..."
+
+	# load dependencies
+	modprobe udp_tunnel
+	modprobe ip6_udp_tunnel
+
+	if ! insmod "${mod}"
+	then
+		dmesg | grep wireguard
+		echo "Failed to load wireguard module."
+		return 1
+	else
+		dmesg | grep wireguard
+		echo "Succesfully loaded wireguard module!"
+		return 0
+	fi
+}
+
+if ! insmod
+then
+	/usr/src/app/buildmod.sh
+    insmod || echo "No kernel module support found."
+fi
+
 config_root=/etc/wireguard
-module_path=/usr/src/app/wireguard.ko
 server_template=/usr/src/app/templates/server.conf
 peer_template=/usr/src/app/templates/peer.conf
 
@@ -18,37 +52,7 @@ server_conf_path="${config_root}"/wg0.conf
 server_key_path="${config_root}"/wg0.key
 server_pub_path="${config_root}"/wg0.pub
 
-# load required modules
-echo "Loading udp_tunnel module..."
-modprobe udp_tunnel
-echo "Loading ip6_udp_tunnel module..."
-modprobe ip6_udp_tunnel
-
-# load wireguard module and grep dmesg to logs
-echo "Loading wireguard module..."
-modinfo "${module_path}"
-insmod "${module_path}" || true
-dmesg | grep wireguard
-
 mkdir -p "${config_root}"
-
-ipcalc_network() {
-    ipcalc -n -b "$@" | grep Network: | awk '{print $2}'
-}
-
-ipcalc_hostmin() {
-    ipcalc -n -b "$@" | grep HostMin: | awk '{print $2}'
-}
-
-ipcalc_hostmax() {
-    ipcalc -n -b "$@" | grep HostMax: | awk '{print $2}'
-}
-
-prips() {
-    IFS=. read -r a b c d <<< "$(ipcalc_hostmin "$@")"
-    IFS=. read -r e f g h <<< "$(ipcalc_hostmax "$@")"
-    eval "echo {$a..$e}.{$b..$f}.{$c..$g}.{$d..$h}"
-}
 
 # lookup public ip if server host is not provided
 if [ -z "${SERVER_HOST}" ] || [ "${SERVER_HOST}" = "auto" ]
@@ -71,8 +75,14 @@ then
     wg genkey | tee "${server_key_path}" | wg pubkey > "${server_pub_path}"
 fi
 
-NETWORK="$(ipcalc_network "${NETWORK}")"
-SERVER_ADDRESS="$(ipcalc_hostmin "${NETWORK}")"
+eval "$(ipcalc --silent --network "${CIDR}")" # NETWORK
+eval "$(ipcalc --silent --minaddr "${CIDR}")" # MINADDR
+eval "$(ipcalc --silent --maxaddr "${CIDR}")" # MAXADDR
+eval "$(ipcalc --silent --broadcast "${CIDR}")" # BROADCAST
+
+AVAILABLE_IPS="$(./prips.sh "${MINADDR}" "${MAXADDR}")"
+
+SERVER_ADDRESS="${MINADDR}"
 SERVER_PRIVKEY="$(cat "${server_key_path}")"
 SERVER_PUBKEY="$(cat "${server_pub_path}")"
 
@@ -105,27 +115,36 @@ do
     PEER_PUBKEY="$(cat "${peer_pub_path}")"
     PEER_ADDRESS=
 
+    # reuse the IP address is config already exists for this peer
     if [ -f "${peer_conf_path}" ]
     then
-        # reuse the IP address is config already exists for this peer
-        PEER_ADDRESS="$(grep "Address" "${peer_conf_path}" | awk '{print $NF}')"
+        existing_peer_address="$(grep "Address" "${peer_conf_path}" | awk '{print $NF}')"
+        if grep -wq "${PEER_ADDRESS}" <<< "${AVAILABLE_IPS}"
+        then
+            PEER_ADDRESS="${existing_peer_address}"
+            echo "Reusing existing address for peer ${peer}..."
+            echo "${PEER_ADDRESS}"
+        fi
     fi
 
-    # assign a new IP if peer address does not match the internal subnet
-    if [ "$(ipcalc_network "${PEER_ADDRESS}")" != "${NETWORK}" ]
+    # assign a new IP
+    if [ -z "${PEER_ADDRESS}" ]
     then
-        for addr in $(prips "${NETWORK}")
+        for addr in ${AVAILABLE_IPS}
         do
             # determine the first unused IP address
             PEER_ADDRESS="${addr}"
-            grep -q -R "${PEER_ADDRESS}" "${config_root}"/*.conf || break
+            grep -q "${PEER_ADDRESS}" "${config_root}"/*.conf || break
         done
         echo "Assigning unused address for peer ${peer}..."
-    else
-        echo "Reusing existing address for peer ${peer}..."
+        echo "${PEER_ADDRESS}"
     fi
 
-    echo "${PEER_ADDRESS}"
+    if [ -z "${PEER_ADDRESS}" ]
+    then
+        echo "Failed to find unused IP address for ${peer}!"
+        tail -f /dev/null
+    fi
 
     # substitute env vars in peer template conf
     export PEER_ADDRESS PEER_PRIVKEY PEER_DNS SERVER_PUBKEY SERVER_HOST SERVER_PORT ALLOWEDIPS
@@ -151,3 +170,5 @@ chmod 600 "${config_root}"/*
 
 echo "Bringing interface wg0 up..."
 wg-quick up wg0
+
+tail -f /dev/null
